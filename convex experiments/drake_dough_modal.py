@@ -15,7 +15,7 @@ What this measures, and how:
     and compute real-time rate = dt / runtime-per-step. See bench_realtime.py.
 
 Usage:
-    modal run drake_dough_modal.py::main           # default: paper settings
+    modal run drake_dough_modal.py                 # default: paper settings
     modal run drake_dough_modal.py --record        # also dump html + obj (slow)
     modal run drake_dough_modal.py::bench --run-id dough-...   # re-analyze a log
     modal volume get drake-mpm-outputs <run_id> ./results
@@ -116,7 +116,7 @@ def run_dough(
     import os
     import shutil
 
-    from bench_realtime import analyze, parse_step_times
+    from bench_realtime import analyze_full, parse_step_times
 
     run_id = run_id or f"dough-dt{int(time_step * 1000)}ms-mu{friction}-{int(time.time())}"
     out_dir = Path("/outputs") / run_id
@@ -159,8 +159,8 @@ def run_dough(
     (out_dir / "stderr.log").write_text(proc.stderr)
 
     step_ms, substeps = parse_step_times(proc.stdout)
-    bench = analyze(step_ms, dt_s=time_step,
-                    simulation_time_s=simulation_time, reference="Dough Rolling")
+    bench = analyze_full(proc.stdout, dt_s=time_step,
+                         simulation_time_s=simulation_time, reference="Dough Rolling")
     bench["config"] = {
         "time_step_s": time_step, "substep_s": substep, "N_substeps": n_substeps,
         "friction": friction, "stiffness": stiffness, "ppc": ppc,
@@ -222,6 +222,10 @@ def main(simulation_time: float = 10.0, record: bool = False):
     print(f"  real-time rate     : {rt.get('from_mean_all')}"
           f"   [paper: {pc.get('paper_rt_rate')} at eps_r=5e-2]")
     print(f"  note               : {pc.get('note')}")
+    ca = b.get("contact_analysis")
+    if ca:
+        print("\n  --- contact-regime split (measured n_contacts) ---")
+        print(f"  {ca['interpretation']}")
     print(f"\nFetch: modal volume get drake-mpm-outputs "
           f"{b.get('config', {}).get('run_id', '<run_id>')} ./results/")
 
