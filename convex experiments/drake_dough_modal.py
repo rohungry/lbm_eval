@@ -125,8 +125,15 @@ def run_dough(
     subprocess.run(["nvidia-smi"], check=False)
     scratch = Path("/tmp/sim_out")
     scratch.mkdir(exist_ok=True)
-    for f in scratch.iterdir():
-        f.unlink()
+    for f in scratch.glob("*"):
+        if f.is_file():
+            f.unlink()
+
+    # Marker so artifact collection picks up only THIS run's dumps (Dump()
+    # writes relative paths -> they land in the bazel runfiles cwd, not here).
+    marker = Path("/tmp/.dough_marker")
+    marker.touch()
+    time.sleep(1.1)
 
     n_substeps = round(time_step / substep)
 
@@ -171,13 +178,39 @@ def run_dough(
     bench["substeps_observed"] = sorted(set(s for s in substeps if s > 0))
 
     if record:  # collect html + obj dumps if we made them
+        import re as _re
+        find = subprocess.run(
+            ["find", "/tmp", str(Path.home()), "/root/drake",
+             "(", "-name", "test*.obj", "-o", "-name", "*.html", ")",
+             "-newer", str(marker)],
+            capture_output=True, text=True,
+        )
+        found = [Path(p) for p in find.stdout.splitlines()
+                 if p.strip() and "/outputs/" not in p]
         arts = []
-        for f in scratch.iterdir():
+        for f in found:
             if f.is_file():
-                shutil.copy2(f, out_dir / f.name)
-                arts.append(f.name)
+                dest = out_dir / f.name
+                if dest.exists():
+                    dest = out_dir / f"{f.parent.name}__{f.name}"
+                shutil.copy2(f, dest)
+                arts.append(dest.name)
         bench["artifacts"] = {"count": len(arts),
                               "examples": [a for a in arts if not a.startswith("test")][:4]}
+        # Ground-truth particle count: the dough is a volumetric MPM body, so
+        # each 'v' line in a frame dump is one particle (n_faces == 0, no mesh).
+        obj_dumps = sorted(
+            (out_dir / a for a in arts if "test" in a and a.endswith(".obj")),
+            key=lambda p: int(_re.findall(r"\d+", p.stem)[-1]) if _re.findall(r"\d+", p.stem) else 0,
+        )
+        if obj_dumps:
+            n_particles = sum(1 for ln in obj_dumps[0].read_text().splitlines()
+                              if ln.startswith("v "))
+            bench["particle_count"] = n_particles
+            bench["particle_count_vs_paper"] = {
+                "ours": n_particles, "paper": 5920,
+                "ratio": round(n_particles / 5920, 3),
+            }
 
     (out_dir / "bench.json").write_text(_json_dumps(bench))
     outputs.commit()
@@ -197,6 +230,120 @@ def _json_dumps(obj) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+@app.function(image=image, gpu="L40S", timeout=30 * 60, volumes={"/outputs": outputs})
+def probe_count(ppc: float, time_step: float = 1e-2) -> dict:
+    """Cheaply instantiate the dough at a given ppc and count particles.
+
+    Runs only ~3 steps with file dumps on, then counts 'v' lines in the first
+    frame dump (= particle count for the volumetric dough). This is the ground
+    truth the analytic geometry estimate can't pin down, since it depends on
+    the MPM sampler's exact cell-rounding convention.
+    """
+    import os
+    from pathlib import Path
+
+    scratch = Path("/tmp/sim_out")
+    scratch.mkdir(exist_ok=True)
+    for f in scratch.glob("test*.obj"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+    # Marker so we only pick up dumps from THIS run.
+    marker = Path("/tmp/.probe_marker")
+    marker.touch()
+    time.sleep(1.1)
+
+    cmd = [
+        "bazel", "run", "--config", "omp", f"{EXAMPLE_PKG}:{ROLL_TARGET}", "--",
+        "--simulation_time=0.1", f"--time_step={time_step}", f"--ppc={ppc}",
+        "--write_files=true", "--visualize=false", "--realtime_rate=0",
+    ]
+    proc = subprocess.run(cmd, cwd=DRAKE_DIR, capture_output=True, text=True,
+                          env={**os.environ, "LCM_DEFAULT_URL": "memq://"})
+
+    # Dump() writes "test<frame>.obj" to a RELATIVE path, so under `bazel run`
+    # the files land in the runfiles cwd (~/.cache/bazel/...), not /tmp/sim_out.
+    # Find them by mtime across the likely roots, like the t-shirt harness did.
+    import re as _re
+    find = subprocess.run(
+        ["find", "/tmp", str(Path.home()), "/root/drake", "-name", "test*.obj",
+         "-newer", str(marker)],
+        capture_output=True, text=True,
+    )
+    candidates = [Path(p) for p in find.stdout.splitlines() if p.strip()]
+
+    def frame_idx(p: Path) -> int:
+        nums = _re.findall(r"\d+", p.stem)
+        return int(nums[-1]) if nums else 0
+
+    dumps = sorted(candidates, key=frame_idx)
+    count = None
+    counted_file = None
+    if dumps:
+        counted_file = str(dumps[0])
+        count = sum(1 for ln in dumps[0].read_text().splitlines() if ln.startswith("v "))
+    hints = [l.strip() for l in proc.stdout.splitlines()
+             if any(k in l.lower() for k in ("particle", "n_vert", "dof", " nv"))][:5]
+    result = {"ppc": ppc, "particle_count": count, "counted_file": counted_file,
+              "n_dumps_found": len(dumps),
+              "returncode": proc.returncode, "log_hints": hints}
+    if count is None:
+        result["stderr_tail"] = proc.stderr[-1500:]
+        result["stdout_tail"] = proc.stdout[-1500:]
+    print(_json_dumps(result))
+    return result
+
+
+@app.local_entrypoint()
+def findppc(candidates: str = "1,2,3,4", target: int = 5920):
+    """Probe ppc values in parallel, map the ppc->particle-count curve, and
+    recommend the ppc nearest the paper's count. Defaults span low ppc because
+    the count scales steeply (ppc=6 already gives ~13.6k). Pass fractional
+    candidates too, e.g. --candidates 2,2.5,3,3.5
+    e.g. modal run drake_dough_modal.py::findppc
+    """
+    cs = sorted(float(x) for x in candidates.split(","))
+    handles = [(c, probe_count.spawn(c)) for c in cs]
+    print(f"\n{'ppc':>6} {'particles':>10}  {'x paper':>8}  {'delta':>8}")
+    pairs = []
+    best = None
+    for c, h in handles:
+        r = h.get()
+        n = r.get("particle_count")
+        if n:
+            pairs.append((c, n))
+            d = abs(n - target)
+            print(f"{c:>6} {n:>10}  {n / target:>7.2f}x  {d:>8}")
+            if best is None or d < best[2]:
+                best = (c, n, d)
+        else:
+            print(f"{c:>6} {'FAILED':>10}  (rc={r.get('returncode')}, "
+                  f"dumps={r.get('n_dumps_found')})")
+
+    if not pairs:
+        print("\nNo counts returned -- check probe_count logs.")
+        return
+
+    # Linear interpolation across the bracketing pair to suggest a ppc that
+    # would hit the target exactly (the sampler may quantize, so treat as a
+    # starting guess to verify with one more probe).
+    pairs.sort()
+    suggestion = None
+    for (c0, n0), (c1, n1) in zip(pairs, pairs[1:]):
+        if n0 <= target <= n1 and n1 != n0:
+            suggestion = c0 + (c1 - c0) * (target - n0) / (n1 - n0)
+            break
+
+    print(f"\nClosest probed: ppc={best[0]} -> {best[1]} ({best[1] / target:.2f}x paper)")
+    if suggestion:
+        print(f"Interpolated ppc for ~{target}: {suggestion:.2f}  "
+              f"(verify: modal run drake_dough_modal.py::probe_count --ppc {suggestion:.2f})")
+    print(f"Then matched run: modal run drake_dough_modal.py::main "
+          f"--ppc <chosen> --record")
+
+
 @app.function(image=image, volumes={"/outputs": outputs}, timeout=600)
 def rescore(run_id: str, dt_s: float = 1e-2, simulation_time: float = 10.0) -> dict:
     """Re-analyze a saved stdout.log on the Volume without re-simulating."""
@@ -210,13 +357,19 @@ def rescore(run_id: str, dt_s: float = 1e-2, simulation_time: float = 10.0) -> d
 
 
 @app.local_entrypoint()
-def main(simulation_time: float = 10.0, record: bool = False):
-    """Single dough run at paper settings (dt=10 ms, N=10, mu=1.0)."""
-    b = run_dough.remote(simulation_time=simulation_time, record=record)
+def main(simulation_time: float = 10.0, record: bool = False, ppc: float = 3):
+    """Single dough run at paper settings (dt=10 ms, N=10, mu=1.0).
+    Pass --ppc to match the paper's particle count (use ::findppc to calibrate);
+    --record dumps frames so the particle count is reported."""
+    b = run_dough.remote(simulation_time=simulation_time, record=record, ppc=ppc)
     rt = b.get("real_time_rate", {})
     pc = b.get("paper_comparison", {})
     print("\n=== Dough rolling benchmark ===")
     print(f"  steps logged       : {b.get('n_steps_logged')}")
+    if b.get("particle_count") is not None:
+        pcvp = b.get("particle_count_vs_paper", {})
+        print(f"  particles          : {b['particle_count']}"
+              f"   [paper: 5920, ratio {pcvp.get('ratio')}]")
     print(f"  runtime/step (mean): {b.get('runtime_ms_per_step', {}).get('all_steps', {}).get('mean')} ms"
           f"   [paper: {pc.get('paper_runtime_ms')} ms]")
     print(f"  real-time rate     : {rt.get('from_mean_all')}"
@@ -229,7 +382,7 @@ def main(simulation_time: float = 10.0, record: bool = False):
     print(f"\nFetch: modal volume get drake-mpm-outputs "
           f"{b.get('config', {}).get('run_id', '<run_id>')} ./results/")
 
-
+#
 @app.local_entrypoint()
 def bench(run_id: str, dt: float = 1e-2, sim_time: float = 10.0):
     """Re-analyze a saved run: modal run drake_dough_modal.py::bench --run-id ..."""
