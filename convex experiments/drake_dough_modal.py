@@ -52,7 +52,7 @@ ROLL_TARGET = "roll"  # cc_binary name for roll.cc; adjust if BUILD names it oth
 # one cheap extra layer. At runtime, functions can `git fetch fork` + rebuild to
 # pick up new commits without rebuilding the image -- minutes, not hours.
 # Leave FORK_REPO = "" to run stock g1n0st (no fork layer added).
-FORK_REPO = "https://github.com/rohungry/convex_mpm_gpu.git"     # e.g. "https://github.com/rohungry/drake.git"
+FORK_REPO = "https://github.com/rohungry/convex_mpm_gpu.git"           # e.g. "https://github.com/rohungry/drake.git"
 FORK_BRANCH = "hvp-newton-cg"
 
 ROLL_HTML_SED = (
@@ -106,7 +106,6 @@ image = (
         f"bazel build --config omp --jobs=8 {EXAMPLE_PKG}:{ROLL_TARGET}",
     )
     .pip_install("numpy")
-    .add_local_python_source("bench_realtime")
 )
 
 # One extra, cheap layer that builds YOUR fork branch on top of the cached Drake
@@ -123,6 +122,10 @@ if FORK_REPO:
         f"{ROLL_HTML_SED} && "
         f"bazel build --config omp --jobs=8 {EXAMPLE_PKG}:{ROLL_TARGET}",
     )
+
+# add_local_* MUST be the final image op (Modal forbids build steps after it),
+# so this comes AFTER the conditional fork layer above.
+image = image.add_local_python_source("bench_realtime")
 
 
 def _sync_and_build(commit: str | None) -> tuple[bool, str]:
