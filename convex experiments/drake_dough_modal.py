@@ -96,6 +96,50 @@ image = (
 )
 
 
+def _execute_dough(*, time_step, substep, friction, stiffness, simulation_time,
+                   ppc, record=False):
+    """Run the roll binary once and parse it. No volume I/O -- returns
+    (bench dict, completed-process, parsed per-step list). Callable in a loop
+    within one container for variance/determinism measurement."""
+    import os
+    from bench_realtime import analyze_full, parse_step_times, parse_steps_with_contacts
+
+    cmd = [
+        "bazel", "run", "--config", "omp", f"{EXAMPLE_PKG}:{ROLL_TARGET}", "--",
+        f"--simulation_time={simulation_time}",
+        f"--time_step={time_step}",
+        f"--substep={substep}",
+        f"--friction={friction}",
+        f"--stiffness={stiffness}",
+        f"--ppc={ppc}",
+        # 0 = run unthrottled (the default 1.0 caps wall-clock at real time).
+        "--realtime_rate=0",
+        f"--write_files={'true' if record else 'false'}",
+        f"--visualize={'true' if record else 'false'}",
+    ]
+    t0 = time.time()
+    proc = subprocess.run(
+        cmd, cwd=DRAKE_DIR, capture_output=True, text=True,
+        env={**os.environ, "LCM_DEFAULT_URL": "memq://"},
+    )
+    host_wall = time.time() - t0
+
+    _, substeps = parse_step_times(proc.stdout)
+    bench = analyze_full(proc.stdout, dt_s=time_step,
+                         simulation_time_s=simulation_time, reference="Dough Rolling")
+    bench["config"] = {
+        "time_step_s": time_step, "substep_s": substep,
+        "N_substeps": round(time_step / substep),
+        "friction": friction, "stiffness": stiffness, "ppc": ppc,
+        "simulation_time_s": simulation_time, "record": record,
+    }
+    bench["returncode"] = proc.returncode
+    bench["host_wall_s_incl_bazel"] = round(host_wall, 1)
+    bench["substeps_observed"] = sorted(set(s for s in substeps if s > 0))
+    steps = parse_steps_with_contacts(proc.stdout)
+    return bench, proc, steps
+
+
 @app.function(
     image=image,
     gpu="L40S",  # sm_89, same Ada arch as the paper's RTX 4090
@@ -116,8 +160,6 @@ def run_dough(
     import os
     import shutil
 
-    from bench_realtime import analyze_full, parse_step_times
-
     run_id = run_id or f"dough-dt{int(time_step * 1000)}ms-mu{friction}-{int(time.time())}"
     out_dir = Path("/outputs") / run_id
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,47 +177,13 @@ def run_dough(
     marker.touch()
     time.sleep(1.1)
 
-    n_substeps = round(time_step / substep)
-
-    cmd = [
-        "bazel", "run", "--config", "omp", f"{EXAMPLE_PKG}:{ROLL_TARGET}", "--",
-        f"--simulation_time={simulation_time}",
-        f"--time_step={time_step}",
-        f"--substep={substep}",
-        f"--friction={friction}",
-        f"--stiffness={stiffness}",
-        f"--ppc={ppc}",
-        # Critical for benchmarking: 0 = run as fast as possible (no throttle).
-        # The default 1.0 would cap wall-clock at real-time and hide true speed.
-        "--realtime_rate=0",
-        # Off for clean timing; --record flips both on.
-        f"--write_files={'true' if record else 'false'}",
-        f"--visualize={'true' if record else 'false'}",
-    ]
-
-    # Host-side wall clock around the whole bazel-run (includes a few seconds of
-    # bazel launch overhead; the per-step parse below is the clean measurement).
-    t0 = time.time()
-    proc = subprocess.run(
-        cmd, cwd=DRAKE_DIR, capture_output=True, text=True,
-        env={**os.environ, "LCM_DEFAULT_URL": "memq://"},
+    bench, proc, _ = _execute_dough(
+        time_step=time_step, substep=substep, friction=friction,
+        stiffness=stiffness, simulation_time=simulation_time, ppc=ppc, record=record,
     )
-    host_wall = time.time() - t0
 
     (out_dir / "stdout.log").write_text(proc.stdout)
     (out_dir / "stderr.log").write_text(proc.stderr)
-
-    step_ms, substeps = parse_step_times(proc.stdout)
-    bench = analyze_full(proc.stdout, dt_s=time_step,
-                         simulation_time_s=simulation_time, reference="Dough Rolling")
-    bench["config"] = {
-        "time_step_s": time_step, "substep_s": substep, "N_substeps": n_substeps,
-        "friction": friction, "stiffness": stiffness, "ppc": ppc,
-        "simulation_time_s": simulation_time, "record": record,
-    }
-    bench["returncode"] = proc.returncode
-    bench["host_wall_s_incl_bazel"] = round(host_wall, 1)
-    bench["substeps_observed"] = sorted(set(s for s in substeps if s > 0))
 
     if record:  # collect html + obj dumps if we made them
         import re as _re
@@ -219,7 +227,7 @@ def run_dough(
     if proc.returncode != 0:
         print("---- stderr tail ----")
         print(proc.stderr[-3000:])
-    elif not step_ms:
+    elif not bench.get("n_steps_logged"):
         print("WARNING: no 'frame=... time=...ms' lines parsed. Check that the "
               "deformable driver logging is present and the run actually stepped.")
     return bench
@@ -228,6 +236,121 @@ def run_dough(
 def _json_dumps(obj) -> str:
     import json
     return json.dumps(obj, indent=2, default=str)
+
+
+def _mean_std(xs: list[float]) -> dict:
+    import statistics
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return {"n": 0}
+    mean = statistics.mean(xs)
+    std = statistics.pstdev(xs) if len(xs) > 1 else 0.0
+    return {
+        "n": len(xs),
+        "mean": round(mean, 3),
+        "std": round(std, 3),
+        "cv_pct": round(100 * std / mean, 2) if mean else None,  # noise floor as %
+        "min": round(min(xs), 3),
+        "max": round(max(xs), 3),
+    }
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    timeout=4 * 60 * 60,
+    volumes={"/outputs": outputs},
+)
+def repeat_runs(
+    n: int = 5,
+    time_step: float = 1e-2,
+    substep: float = 1e-3,
+    friction: float = 1.0,
+    stiffness: float = 1e3,
+    simulation_time: float = 10.0,
+    ppc: float = 1.45,           # paper-matched (5,999 particles)
+    run_id: str | None = None,
+) -> dict:
+    """Run the SAME config n times in ONE container (one warm GPU) to measure
+    run-to-run variance and determinism. Same-instance is deliberate: it's the
+    condition you'd A/B two algorithms under (back-to-back on one GPU), so its
+    spread is the noise floor a real % lift must clear. Inter-instance variance
+    would be larger."""
+    run_id = run_id or f"dough-repeat-n{n}-ppc{ppc}-{int(time.time())}"
+    out_dir = Path("/outputs") / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["nvidia-smi"], check=False)
+
+    per_run = []
+    step_seqs = []  # per-run [(peak_contacts, total_iters), ...] for determinism
+    for i in range(n):
+        bench, proc, steps = _execute_dough(
+            time_step=time_step, substep=substep, friction=friction,
+            stiffness=stiffness, simulation_time=simulation_time, ppc=ppc, record=False,
+        )
+        if bench["returncode"] != 0:
+            per_run.append({"run": i, "returncode": bench["returncode"], "failed": True})
+            continue
+        rt = bench["real_time_rate"]
+        st = bench["runtime_ms_per_step"]["all_steps"]
+        ca = bench.get("contact_analysis", {})
+        ic = ca.get("regimes", {}).get("in_contact", {})
+        per_run.append({
+            "run": i,
+            "runtime_ms_mean": st["mean"],
+            "runtime_ms_median": st["median"],
+            "real_time_rate": rt["from_mean_all"],
+            "in_contact_mean_ms": ic.get("mean_ms"),
+            "contact_steps_fraction": ca.get("contact_steps_fraction"),
+            "host_wall_s": bench["host_wall_s_incl_bazel"],
+        })
+        step_seqs.append([(s["peak_contacts"], s["total_iters"]) for s in steps])
+
+    ok = [r for r in per_run if not r.get("failed")]
+
+    # Determinism: compare each run's per-frame (contacts, iters) to run 0.
+    determinism = {"checked": len(step_seqs) >= 2}
+    if len(step_seqs) >= 2:
+        ref = step_seqs[0]
+        diffs = []
+        for i, seq in enumerate(step_seqs[1:], 1):
+            m = min(len(ref), len(seq))
+            c_mis = sum(1 for a, b in zip(ref[:m], seq[:m]) if a[0] != b[0])
+            it_mis = sum(1 for a, b in zip(ref[:m], seq[:m]) if a[1] != b[1])
+            diffs.append({"vs_run0": i, "frames": m,
+                          "contact_count_mismatches": c_mis,
+                          "iter_count_mismatches": it_mis})
+        determinism["bit_identical_contacts"] = all(d["contact_count_mismatches"] == 0 for d in diffs)
+        determinism["bit_identical_iters"] = all(d["iter_count_mismatches"] == 0 for d in diffs)
+        determinism["detail"] = diffs
+
+    summary = {
+        "run_id": run_id, "n_requested": n, "n_succeeded": len(ok),
+        "config": {"time_step_s": time_step, "substep_s": substep, "ppc": ppc,
+                   "friction": friction, "simulation_time_s": simulation_time},
+        "variance": {
+            "runtime_ms_per_step": _mean_std([r["runtime_ms_mean"] for r in ok]),
+            "real_time_rate": _mean_std([r["real_time_rate"] for r in ok]),
+            "in_contact_mean_ms": _mean_std([r["in_contact_mean_ms"] for r in ok]),
+            "contact_steps_fraction": _mean_std([r["contact_steps_fraction"] for r in ok]),
+        },
+        "determinism": determinism,
+        "per_run": per_run,
+    }
+    # Actionable: the smallest lift distinguishable from this baseline's own noise.
+    rt_cv = summary["variance"]["real_time_rate"].get("cv_pct")
+    if rt_cv is not None:
+        summary["min_distinguishable_lift_pct"] = round(2 * rt_cv, 2)
+        summary["min_lift_note"] = (
+            "A real-time-rate lift should exceed ~2x the baseline CV "
+            f"(~{round(2 * rt_cv, 1)}%) to be distinguishable from run-to-run noise "
+            "on the same GPU. Inter-instance comparison needs a larger margin."
+        )
+
+    (out_dir / "repeat_summary.json").write_text(_json_dumps(summary))
+    outputs.commit()
+    print(_json_dumps(summary))
+    return summary
 
 
 @app.function(image=image, gpu="L40S", timeout=30 * 60, volumes={"/outputs": outputs})
@@ -382,8 +505,34 @@ def main(simulation_time: float = 10.0, record: bool = False, ppc: float = 3):
     print(f"\nFetch: modal volume get drake-mpm-outputs "
           f"{b.get('config', {}).get('run_id', '<run_id>')} ./results/")
 
-#
+
 @app.local_entrypoint()
 def bench(run_id: str, dt: float = 1e-2, sim_time: float = 10.0):
     """Re-analyze a saved run: modal run drake_dough_modal.py::bench --run-id ..."""
     rescore.remote(run_id, dt_s=dt, simulation_time=sim_time)
+
+
+@app.local_entrypoint()
+def repeat(n: int = 5, ppc: float = 1.45, simulation_time: float = 10.0):
+    """Characterize run-to-run variance + determinism for a fixed config.
+    e.g. modal run drake_dough_modal.py::repeat --n 8
+    Run this for your baseline AND your new algorithm; a % lift is real only
+    if it exceeds the reported min-distinguishable-lift."""
+    s = repeat_runs.remote(n=n, ppc=ppc, simulation_time=simulation_time)
+    v = s["variance"]
+    d = s["determinism"]
+    print(f"\n=== Repeatability over {s['n_succeeded']}/{s['n_requested']} runs "
+          f"(ppc={ppc}, same GPU) ===")
+    for key, label in [("runtime_ms_per_step", "runtime/step (ms)"),
+                       ("real_time_rate", "real-time rate"),
+                       ("in_contact_mean_ms", "in-contact step (ms)")]:
+        m = v[key]
+        if m.get("n"):
+            print(f"  {label:<22}: {m['mean']} +/- {m['std']}  "
+                  f"(CV {m['cv_pct']}%, range {m['min']}-{m['max']})")
+    if d.get("checked"):
+        det = d.get("bit_identical_contacts") and d.get("bit_identical_iters")
+        print(f"  determinism            : "
+              f"{'bit-identical across runs' if det else 'NON-deterministic (GPU atomics)'}")
+    if s.get("min_distinguishable_lift_pct") is not None:
+        print(f"\n  -> {s['min_lift_note']}")
