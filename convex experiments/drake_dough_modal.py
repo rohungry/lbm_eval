@@ -46,6 +46,20 @@ DRAKE_DIR = "/root/drake"
 EXAMPLE_PKG = "//examples/multibody/deformable"
 ROLL_TARGET = "roll"  # cc_binary name for roll.cc; adjust if BUILD names it otherwise
 
+# --- YOUR FORK (set these two to test your HvP branch) ----------------------
+# The image keeps cloning g1n0st (so the expensive Drake build stays cached from
+# your earlier runs), then adds your fork as a remote and builds YOUR branch in
+# one cheap extra layer. At runtime, functions can `git fetch fork` + rebuild to
+# pick up new commits without rebuilding the image -- minutes, not hours.
+# Leave FORK_REPO = "" to run stock g1n0st (no fork layer added).
+FORK_REPO = "https://github.com/rohungry/convex_mpm_gpu.git"     # e.g. "https://github.com/rohungry/drake.git"
+FORK_BRANCH = "hvp-newton-cg"
+
+ROLL_HTML_SED = (
+    "sed -i 's|/home/changyu/drake/roll.html|/tmp/sim_out/roll.html|g' "
+    "examples/multibody/deformable/roll.cc"
+)
+
 # --- These five strings are byte-identical to drake_mpm_modal.py so the ---
 # --- expensive image layers are reused from cache, not rebuilt.          ---
 PATCH_MESH_CMD = (
@@ -94,6 +108,53 @@ image = (
     .pip_install("numpy")
     .add_local_python_source("bench_realtime")
 )
+
+# One extra, cheap layer that builds YOUR fork branch on top of the cached Drake
+# build. Added only if FORK_REPO is set. Because every layer above is byte-
+# identical to your prior runs, they're reused from cache; this layer just adds
+# the fork remote, checks out your branch, re-applies the roll.html patch, and
+# incrementally rebuilds roll (warm bazel cache => minutes).
+if FORK_REPO:
+    image = image.run_commands(
+        f"cd {DRAKE_DIR} && "
+        f"(git remote add fork {FORK_REPO} || git remote set-url fork {FORK_REPO}) && "
+        f"git fetch fork {FORK_BRANCH} && "
+        f"git reset --hard fork/{FORK_BRANCH} && "
+        f"{ROLL_HTML_SED} && "
+        f"bazel build --config omp --jobs=8 {EXAMPLE_PKG}:{ROLL_TARGET}",
+    )
+
+
+def _sync_and_build(commit: str | None) -> tuple[bool, str]:
+    """Inside the container: fetch the fork, hard-checkout `commit` (or the fork
+    branch head if commit in {None,'latest'}), re-apply the roll.html patch, and
+    incrementally rebuild roll on the warm bazel cache (minutes). Returns
+    (ok, tail-log). No-op-with-error if the fork remote isn't configured."""
+    import os
+
+    if not FORK_REPO:
+        return False, ("FORK_REPO is empty. Set FORK_REPO/FORK_BRANCH at the top "
+                       "of drake_dough_modal.py and re-deploy the image once.")
+    target = f"fork/{FORK_BRANCH}" if commit in (None, "latest") else commit
+    log = []
+
+    def run(cmd, shell=False):
+        p = subprocess.run(cmd, cwd=DRAKE_DIR, capture_output=True, text=True, shell=shell)
+        log.append(f"$ {cmd if shell else ' '.join(cmd)}\n{p.stdout[-400:]}{p.stderr[-400:]}")
+        return p
+
+    if run(["git", "fetch", "fork", FORK_BRANCH]).returncode != 0:
+        return False, "git fetch failed:\n" + "\n".join(log)
+    if run(["git", "reset", "--hard", target]).returncode != 0:
+        return False, "git reset failed (bad commit/branch?):\n" + "\n".join(log)
+    run(ROLL_HTML_SED, shell=True)  # idempotent
+    b = run(["bazel", "build", "--config", "omp", "--jobs=8",
+             f"{EXAMPLE_PKG}:{ROLL_TARGET}"])
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                          cwd=DRAKE_DIR, capture_output=True, text=True).stdout.strip()
+    if b.returncode != 0:
+        return False, f"bazel build FAILED at {head}:\n" + b.stderr[-3000:]
+    return True, f"built {head}"
 
 
 def _execute_dough(*, time_step, substep, friction, stiffness, simulation_time,
@@ -155,10 +216,17 @@ def run_dough(
     ppc: float = 3,
     record: bool = False,        # if True: dump html+obj (overhead; not for timing)
     run_id: str | None = None,
+    commit: str | None = None,   # if set: git fetch fork + checkout + rebuild first
 ) -> dict:
     """Run roll.cc unthrottled, parse per-step timing, compute real-time rate."""
     import os
     import shutil
+
+    if commit is not None:
+        ok, tail = _sync_and_build(commit)
+        if not ok:
+            print(tail)
+            return {"built": False, "build_error": tail}
 
     run_id = run_id or f"dough-dt{int(time_step * 1000)}ms-mu{friction}-{int(time.time())}"
     out_dir = Path("/outputs") / run_id
@@ -353,8 +421,57 @@ def repeat_runs(
     return summary
 
 
+@app.function(image=image, gpu="L40S", timeout=60 * 60, volumes={"/outputs": outputs})
+def run_selftest(commit: str | None = None, ppc: float = 1.45,
+                 simulation_time: float = 5.0) -> dict:
+    """Build (optionally syncing to `commit`) and run the HvP self-test.
+    Sets MPM_HVP_SELFTEST=1, runs roll until the first contact-bearing substep,
+    and echoes the three [hvp] PASS/FAIL lines. The C++ hook std::exit(0)s after
+    printing, so the run stops as soon as contacts appear."""
+    import os
+    import re
+
+    if commit is not None:
+        ok, tail = _sync_and_build(commit)
+        if not ok:
+            print(tail)
+            return {"built": False, "build_error": tail}
+
+    subprocess.run(["nvidia-smi"], check=False)
+    env = {**os.environ, "LCM_DEFAULT_URL": "memq://", "MPM_HVP_SELFTEST": "1"}
+    cmd = [
+        "bazel", "run", "--config", "omp", f"{EXAMPLE_PKG}:{ROLL_TARGET}", "--",
+        f"--simulation_time={simulation_time}", f"--ppc={ppc}",
+        "--realtime_rate=0", "--visualize=false", "--write_files=false",
+    ]
+    p = subprocess.run(cmd, cwd=DRAKE_DIR, capture_output=True, text=True, env=env)
+
+    hvp = [ln for ln in p.stdout.splitlines() if "[hvp" in ln]
+    # strip ANSI color if the driver added any
+    hvp = [re.sub(r"\x1b\[[0-9;]*m", "", ln).strip() for ln in hvp]
+    passed = any("OVERALL: PASS" in ln for ln in hvp)
+    saw_overall = any("OVERALL" in ln for ln in hvp)
+
+    print("\n=== HvP self-test ===")
+    if hvp:
+        for ln in hvp:
+            print("  " + ln)
+    else:
+        print("  (no [hvp] lines found)")
+        print("  --- stdout tail ---\n" + p.stdout[-1800:])
+        print("  --- stderr tail ---\n" + p.stderr[-1800:])
+        # common cause: never reached a contact-bearing substep in the window
+        if "no contacts" not in p.stdout:
+            print("  hint: contacts may not have formed within "
+                  f"simulation_time={simulation_time}s; try a larger value.")
+
+    return {"built": True, "returncode": p.returncode, "passed": passed,
+            "saw_overall": saw_overall, "hvp_lines": hvp}
+
+
 @app.function(image=image, gpu="L40S", timeout=30 * 60, volumes={"/outputs": outputs})
-def probe_count(ppc: float, time_step: float = 1e-2) -> dict:
+def probe_count(ppc: float, time_step: float = 1e-2,
+                commit: str | None = None) -> dict:
     """Cheaply instantiate the dough at a given ppc and count particles.
 
     Runs only ~3 steps with file dumps on, then counts 'v' lines in the first
@@ -364,6 +481,12 @@ def probe_count(ppc: float, time_step: float = 1e-2) -> dict:
     """
     import os
     from pathlib import Path
+
+    if commit is not None:
+        ok, tail = _sync_and_build(commit)
+        if not ok:
+            print(tail)
+            return {"built": False, "build_error": tail, "particle_count": None}
 
     scratch = Path("/tmp/sim_out")
     scratch.mkdir(exist_ok=True)
@@ -477,6 +600,26 @@ def rescore(run_id: str, dt_s: float = 1e-2, simulation_time: float = 10.0) -> d
                            dt_s=dt_s, simulation_time_s=simulation_time)
     print(_json_dumps(out))
     return out
+
+
+@app.local_entrypoint()
+def selftest(commit: str = "latest", ppc: float = 1.45, simulation_time: float = 5.0):
+    """Push your fork, then: modal run drake_dough_modal.py::selftest
+    Syncs the container to your fork branch head (or --commit <sha>), rebuilds
+    roll incrementally, runs the HvP self-test, prints the three PASS/FAIL lines.
+    Tight loop: edit -> git push -> this (minutes), no image rebuild."""
+    r = run_selftest.remote(commit=commit, ppc=ppc, simulation_time=simulation_time)
+    if not r.get("built", True):
+        print("\nBUILD FAILED — see tail above.")
+        return
+    if r.get("passed"):
+        print("\n  => operator validated. Next: Newton-CG.")
+    elif r.get("saw_overall"):
+        print("\n  => a check FAILED. FD-large: v0/current_velocities binding; "
+              "symmetry: scatter transpose; PD: precompute sign. Paste the lines.")
+    else:
+        print("\n  => self-test didn't run to completion (no OVERALL line). "
+              "Check the tail above.")
 
 
 @app.local_entrypoint()
